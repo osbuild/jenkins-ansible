@@ -1,0 +1,132 @@
+---
+
+- hosts: jenkins
+  become: yes
+  vars:
+    jenkins_fqdn: jenkins.osbuild.org
+  tasks:
+
+    - name: Update all packages
+      apt:
+        name: "*"
+        state: latest
+        update_cache: yes
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - bwm-ng
+          - ca-certificates
+          - certbot
+          - curl
+          - docker-compose
+          - gnupg2
+          - htop
+          - python-docker
+          - software-properties-common
+        state: present
+
+    - name: Check if swap file exists
+      stat:
+        path: /swapfile
+      register: swapfile
+
+    - name: Create a swap file
+      command: fallocate -l 2G /swapfile
+      when: not swapfile.stat.exists
+
+    - name: Set permissions on swap file
+      file:
+        path: /swapfile
+        owner: root
+        group: root
+        mode: 0600
+      when: not swapfile.stat.exists
+
+    - name: Create swap filesystem on swap file
+      command: mkswap /swapfile
+      when: not swapfile.stat.exists
+
+    - name: Enable swap
+      command: swapon /swapfile
+      when: not swapfile.stat.exists
+
+    - name: Add docker engine repository GPG key
+      apt_key:
+        id: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+        url: https://download.docker.com/linux/debian/gpg
+        state: present
+
+    - name: Add docker engine repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/debian buster stable"
+        state: present
+        update_cache: no
+      register: docker_engine_repo
+
+    - name: Install docker engine
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+      when: docker_engine_repo is changed
+
+    - name: Create directories to hold configuration files
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: 0777
+      loop:
+        - /opt/jenkins
+        - /opt/nginx
+
+    - name: Deploy docker-compose configuration
+      copy:
+        src: files/docker-compose.yml
+        dest: /root/docker-compose.yml
+
+    - name: Get certificates from LetsEncrypt
+      command: |
+        certbot --agree-tos certonly \
+          -d {{ jenkins_fqdn }} -m major@mhtx.net \
+          --standalone -n
+      args:
+        creates: /opt/nginx/server.crt
+      tags:
+        - certificates
+
+    - name: Copy the certificate and key into place
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        remote_src: yes
+      loop:
+        - src: "/etc/letsencrypt/live/{{ jenkins_fqdn }}/fullchain.pem"
+          dest: /opt/nginx/server.crt
+        - src: "/etc/letsencrypt/live/{{ jenkins_fqdn }}/privkey.pem"
+          dest: /opt/nginx/server.key
+      register: certificate_copy
+
+    - name: Deploy nginx configuration
+      copy:
+        src: files/nginx.conf
+        dest: /opt/nginx/nginx.conf
+      register: nginx_config
+
+    - name: Start containers
+      docker_compose:
+        pull: yes
+        project_src: /root
+        state: present
+
+    - name: Restart nginx if config changed
+      docker_compose:
+        project_src: /root
+        restarted: "{{ nginx_config is changed or certificate_copy is changed }}"
+        services:
+          - nginx
+        state: present
